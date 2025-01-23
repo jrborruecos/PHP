@@ -1,0 +1,117 @@
+[servidores_web]
+servidor1 ansible_host=192.168.1.76 ansible_user=user
+servidor2 ansible_host=192.168.1.86 ansible_user=user
+[nginx_servers]
+192.168.1.100
+
+-------------------------------------------------------------------------------
+
+---
+- name: Instalar y configurar Apache2 en el puerto 8080
+  hosts: servidores_web
+  become: true
+
+  tasks:
+    - name: Instalar Apache2
+      apt:
+        name: apache2
+        state: present
+        update_cache: yes
+
+    - name: Cambiar el puerto de Apache2 a 8080
+      lineinfile:
+        path: /etc/apache2/ports.conf
+        regexp: '^Listen 80'
+        line: 'Listen 8080'
+        state: present
+
+    - name: Actualizar VirtualHost en el puerto 8080
+      replace:
+        path: /etc/apache2/sites-available/000-default.conf
+        regexp: 'VirtualHost \*:80'
+        replace: 'VirtualHost *:8080'
+
+    - name: Reiniciar Apache2 para aplicar cambios
+      service:
+        name: apache2
+        state: restarted
+        enabled: yes
+
+---
+- name: Configurar Nginx con HTTPS y balanceo de carga hacia servidores Apache en el puerto 8080
+  hosts: nginx_servers
+  become: true
+  vars:
+    ssl_certificate_path: /etc/ssl/certs/nginx-selfsigned.crt
+    ssl_certificate_key_path: /etc/ssl/private/nginx-selfsigned.key
+    upstream_servers:
+      - "192.168.1.76"
+      - "192.168.1.86"
+
+  tasks:
+    - name: Instalar Nginx y OpenSSL
+      ansible.builtin.apt:
+        name:
+          - nginx
+          - openssl
+        state: present
+        update_cache: true
+
+    - name: Crear certificado SSL autofirmado
+      ansible.builtin.command:
+        cmd: >
+          openssl req -x509 -nodes -days 365 -newkey rsa:2048
+          -keyout {{ ssl_certificate_key_path }}
+          -out {{ ssl_certificate_path }}
+          -subj "/C=US/ST=State/L=City/O=Organization/OU=Unit/CN=localhost"
+        creates: "{{ ssl_certificate_path }}"
+
+    - name: Crear archivo de configuraci贸n de Nginx
+      ansible.builtin.copy:
+        dest: /etc/nginx/sites-available/proxy
+        content: |
+          upstream backend_servers {
+              {% for server in upstream_servers %}
+              server {{ server }}:8080;
+              {% endfor %}
+          }
+
+          server {
+              listen 80;
+              server_name localhost;
+
+              return 301 https://$host$request_uri;
+          }
+
+          server {
+              listen 443 ssl;
+              server_name localhost;
+
+              ssl_certificate {{ ssl_certificate_path }};
+              ssl_certificate_key {{ ssl_certificate_key_path }};
+
+              location / {
+                  proxy_pass http://backend_servers;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+          }
+
+    - name: Crear enlace simb贸lico para habilitar la configuraci贸n
+      ansible.builtin.file:
+        src: /etc/nginx/sites-available/proxy
+        dest: /etc/nginx/sites-enabled/proxy
+        state: link
+
+    - name: Eliminar el enlace simb贸lico del sitio por defecto
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Reiniciar Nginx para aplicar los cambios
+      ansible.builtin.service:
+        name: nginx
+        state: restarted
+        enabled: true
